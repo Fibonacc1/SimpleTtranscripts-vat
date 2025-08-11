@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime
 import time
 import atexit
+import sys
 
 class AudioProcessorGUI:
     def __init__(self, root):
@@ -567,19 +568,42 @@ class AudioProcessorGUI:
             
         threading.Thread(target=full_process, daemon=True).start()
 
-if __name__ == "__main__":
+
+def transcribe_file(audio_path: Path, model_name: str = "large-v3"):
+    """Transcribe the given audio file and save a `.txt` alongside it."""
     try:
-        root = tk.Tk()
-        app = AudioProcessorGUI(root)
-        root.mainloop()
+        import whisper
+
+        model = whisper.load_model(model_name)
+        result = model.transcribe(str(audio_path))
+        txt_path = audio_path.with_suffix('.txt')
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(result.get('text', ''))
+        print(f"✓ Транскрипция сохранена в {txt_path}")
     except Exception as e:
-        import traceback
-        with open("error_log.txt", "w", encoding="utf-8") as f:
-            f.write(f"Ошибка при запуске GUI:\n{e}\n\n")
-            f.write(traceback.format_exc())
+        # Выводим ошибку, чтобы GUI мог отобразить её в логе
+        print(f"❌ Ошибка транскрипции: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    # При наличии аргумента командной строки работаем в режиме CLI
+    if len(sys.argv) > 1:
+        audio = Path(sys.argv[1])
+        transcribe_file(audio)
+    else:
         try:
-            import tkinter.messagebox as mb
-            mb.showerror("Ошибка", f"Не удалось запустить программу:\n{e}")
-        except:
-            print(f"Критическая ошибка: {e}")
-            print(traceback.format_exc())
+            root = tk.Tk()
+            app = AudioProcessorGUI(root)
+            root.mainloop()
+        except Exception as e:
+            import traceback
+            with open("error_log.txt", "w", encoding="utf-8") as f:
+                f.write(f"Ошибка при запуске GUI:\n{e}\n\n")
+                f.write(traceback.format_exc())
+            try:
+                import tkinter.messagebox as mb
+                mb.showerror("Ошибка", f"Не удалось запустить программу:\n{e}")
+            except Exception:
+                print(f"Критическая ошибка: {e}")
+                print(traceback.format_exc())
