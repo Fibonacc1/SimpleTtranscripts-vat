@@ -9,6 +9,10 @@ import time
 import atexit
 import sys
 
+class TranscriptionCancelled(Exception):
+    """Custom exception to signal transcription cancellation."""
+    pass
+
 class AudioProcessorGUI:
     def __init__(self, root):
         self.root = root
@@ -30,8 +34,10 @@ class AudioProcessorGUI:
         
         self.current_work_dir = self.input_dir  # По умолчанию работаем с input
         
-        # Список активных процессов для возможности их остановки
+        # Список активных процессов и активный поток для возможности их остановки
         self.active_processes = []
+        self.current_thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
         
         # Регистрируем обработчики закрытия
         self.register_cleanup_handlers()
@@ -282,32 +288,38 @@ class AudioProcessorGUI:
         
     def stop_all_processes(self):
         """Остановка всех активных процессов"""
-        if not self.active_processes:
+        has_threads = self.current_thread and self.current_thread.is_alive()
+        has_processes = bool(self.active_processes)
+        if not (has_threads or has_processes):
             self.log("⚠️ Нет активных процессов для остановки")
             return
-            
-        self.log("🛑 Останавливаем все активные процессы...")
-        
+
+        self.stop_event.set()
         stopped_count = 0
-        for process in self.active_processes[:]:
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    stopped_count += 1
-                self.active_processes.remove(process)
-            except Exception as e:
-                self.log(f"Ошибка при остановке процесса: {e}")
-        
+
+        if has_processes:
+            self.log("🛑 Останавливаем активные процессы...")
+            for process in self.active_processes[:]:
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                        stopped_count += 1
+                    self.active_processes.remove(process)
+                except Exception as e:
+                    self.log(f"Ошибка при остановке процесса: {e}")
+
+        if has_threads:
+            self.log("🛑 Останавливаем текущую задачу...")
+            # Поток завершится после обработки stop_event
+            self.current_thread = None
+
         self.stop_progress("Процессы остановлены")
-        
-        if stopped_count > 0:
+        if stopped_count:
             self.log(f"✅ Остановлено процессов: {stopped_count}")
-        else:
-            self.log("ℹ️ Все процессы уже завершены")
             
     def cleanup_finished_processes(self):
         """Удаление завершенных процессов из списка"""
@@ -470,8 +482,10 @@ class AudioProcessorGUI:
             self.log_text.see(tk.END)
             self.root.update()
             self.progress_bar['value'] = progress * 100
+            if self.stop_event.is_set():
+                raise TranscriptionCancelled()
 
-        transcribe_file(audio_file, progress_callback=on_progress)
+        transcribe_file(audio_file, progress_callback=on_progress, stop_event=self.stop_event)
             
     def extract_audio(self):
         selected_file = self.get_selected_file()
@@ -521,6 +535,7 @@ class AudioProcessorGUI:
             
         self.log(f"Транскрибируем: {selected_file}")
         self.start_progress("Транскрипция аудио...", determinate=True)
+        self.stop_event.clear()
 
         def transcribe():
             try:
@@ -534,11 +549,15 @@ class AudioProcessorGUI:
                     self.log(f"✓ Транскрипция готова: {audio_file.stem}.txt")
                 self.refresh_files()
                 self.stop_progress("Транскрипция завершена")
+            except TranscriptionCancelled:
+                self.log("⏹ Транскрипция остановлена пользователем")
+                self.stop_progress("Остановлено")
             except Exception as e:
                 self.log(f"❌ Ошибка при транскрипции: {e}")
                 self.stop_progress("Ошибка")
 
-        threading.Thread(target=transcribe, daemon=True).start()
+        self.current_thread = threading.Thread(target=transcribe, daemon=True)
+        self.current_thread.start()
         
     def full_cycle(self):
         selected_file = self.get_selected_file()
@@ -558,7 +577,8 @@ class AudioProcessorGUI:
         
         self.log(f"=== ПОЛНЫЙ ЦИКЛ для: {selected_file} ===")
         self.start_progress("Полный цикл обработки...")
-        
+        self.stop_event.clear()
+
         def full_process():
             self.log("Шаг 1: Извлечение аудио...")
             self.progress_var.set("Извлечение аудио...")
@@ -567,32 +587,41 @@ class AudioProcessorGUI:
                 self.log("❌ Ошибка при извлечении аудио")
                 self.stop_progress("Ошибка")
                 return
-                
+
+            if self.stop_event.is_set():
+                self.stop_progress("Остановлено")
+                return
+
             self.log("✓ Аудио извлечено")
-            
+
             self.log("Шаг 2: Транскрипция...")
             self.start_progress("Транскрипция аудио...", determinate=True)
             try:
                 self.run_transcription(audio_file)
+            except TranscriptionCancelled:
+                self.log("⏹ Транскрипция остановлена пользователем")
+                self.stop_progress("Остановлено")
+                return
             except Exception as e:
                 self.log(f"❌ Ошибка при транскрипции: {e}")
                 self.stop_progress("Ошибка")
                 return
-            
+
             txt_file = audio_file.with_suffix('.txt')
             transcript_file = self.transcripts_dir / txt_file.name
             if txt_file.exists():
                 txt_file.rename(transcript_file)
-                
+
             self.log("✓ Транскрипция готова")
             self.log("=== ПОЛНЫЙ ЦИКЛ ЗАВЕРШЕН ===")
             self.refresh_files()
             self.stop_progress("Полный цикл завершен")
-            
-        threading.Thread(target=full_process, daemon=True).start()
+
+        self.current_thread = threading.Thread(target=full_process, daemon=True)
+        self.current_thread.start()
 
 
-def transcribe_file(audio_path: Path, model_name: str = "large-v3", progress_callback=None):
+def transcribe_file(audio_path: Path, model_name: str = "large-v3", progress_callback=None, stop_event: threading.Event | None = None):
     """Transcribe the given audio file and save a `.txt` alongside it."""
     try:
         import whisper
@@ -605,18 +634,27 @@ def transcribe_file(audio_path: Path, model_name: str = "large-v3", progress_cal
         class TqdmLogger(tqdm.tqdm):
             def __init__(self, *args, **kwargs):
                 self._callback = kwargs.pop("progress_callback", None)
+                self._stop_event = kwargs.pop("stop_event", None)
                 super().__init__(*args, **kwargs)
 
             def update(self, n=1):
+                if self._stop_event and self._stop_event.is_set():
+                    raise TranscriptionCancelled()
                 super().update(n)
-                if self._callback and self.total:
+                if self._callback:
                     elapsed = time.time() - start_time
                     rate = self.n / elapsed if elapsed > 0 else 0
-                    remaining = (self.total - self.n) / rate if rate > 0 else None
-                    self._callback(self.n / self.total, elapsed, remaining)
+                    remaining = (self.total - self.n) / rate if self.total and rate > 0 else None
+                    if self.total:
+                        progress = self.n / self.total
+                    elif remaining is not None:
+                        progress = elapsed / (elapsed + remaining)
+                    else:
+                        progress = 0
+                    self._callback(progress, elapsed, remaining)
 
         old_tqdm = tqdm.tqdm
-        tqdm.tqdm = partial(TqdmLogger, progress_callback=progress_callback)
+        tqdm.tqdm = partial(TqdmLogger, progress_callback=progress_callback, stop_event=stop_event)
         try:
             model = whisper.load_model(model_name)
             result = model.transcribe(str(audio_path))
@@ -627,6 +665,9 @@ def transcribe_file(audio_path: Path, model_name: str = "large-v3", progress_cal
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(result.get('text', ''))
         print(f"✓ Транскрипция сохранена в {txt_path}")
+    except TranscriptionCancelled:
+        print("⏹ Транскрипция остановлена")
+        raise
     except Exception as e:
         # Выводим ошибку, чтобы GUI мог отобразить её в логе
         print(f"❌ Ошибка транскрипции: {e}")
