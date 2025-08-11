@@ -313,12 +313,17 @@ class AudioProcessorGUI:
         """Удаление завершенных процессов из списка"""
         self.active_processes = [p for p in self.active_processes if p.poll() is None]
         
-    def start_progress(self, message):
+    def start_progress(self, message, determinate=False):
         self.progress_var.set(message)
-        self.progress_bar.start(10)
-        
+        if determinate:
+            self.progress_bar.config(mode='determinate', maximum=100, value=0)
+        else:
+            self.progress_bar.config(mode='indeterminate')
+            self.progress_bar.start(10)
+
     def stop_progress(self, message="Готов к работе"):
         self.progress_bar.stop()
+        self.progress_bar.config(mode='indeterminate', value=0)
         self.progress_var.set(message)
         
     def log(self, message):
@@ -448,6 +453,25 @@ class AudioProcessorGUI:
         except Exception as e:
             self.log(f"Ошибка: {e}")
             return False
+
+    def run_transcription(self, audio_file: Path):
+        progress_line = None
+        self.progress_bar.config(mode='determinate', maximum=100, value=0)
+
+        def on_progress(progress, elapsed, remaining):
+            nonlocal progress_line
+            msg = f"Прогресс: {progress*100:.1f}% | прошло: {elapsed:.1f}с"
+            if remaining is not None:
+                msg += f" | осталось: {remaining:.1f}с"
+            if progress_line is not None:
+                self.log_text.delete(f"{progress_line}.0", f"{progress_line + 1}.0")
+            self.log_text.insert(tk.END, msg + "\n")
+            progress_line = int(self.log_text.index(tk.END).split('.')[0]) - 2
+            self.log_text.see(tk.END)
+            self.root.update()
+            self.progress_bar['value'] = progress * 100
+
+        transcribe_file(audio_file, progress_callback=on_progress)
             
     def extract_audio(self):
         selected_file = self.get_selected_file()
@@ -496,12 +520,11 @@ class AudioProcessorGUI:
             return
             
         self.log(f"Транскрибируем: {selected_file}")
-        self.start_progress("Транскрипция аудио...")
-        
+        self.start_progress("Транскрипция аудио...", determinate=True)
+
         def transcribe():
-            scripts_dir = self.base_dir / "scripts"
-            cmd = f'python run_whisper.py "{audio_file}"'
-            if self.run_command(cmd, cwd=scripts_dir):
+            try:
+                self.run_transcription(audio_file)
                 txt_file = audio_file.with_suffix('.txt')
                 transcript_file = self.transcripts_dir / txt_file.name
                 if txt_file.exists():
@@ -511,10 +534,10 @@ class AudioProcessorGUI:
                     self.log(f"✓ Транскрипция готова: {audio_file.stem}.txt")
                 self.refresh_files()
                 self.stop_progress("Транскрипция завершена")
-            else:
-                self.log("❌ Ошибка при транскрипции")
+            except Exception as e:
+                self.log(f"❌ Ошибка при транскрипции: {e}")
                 self.stop_progress("Ошибка")
-                
+
         threading.Thread(target=transcribe, daemon=True).start()
         
     def full_cycle(self):
@@ -548,11 +571,11 @@ class AudioProcessorGUI:
             self.log("✓ Аудио извлечено")
             
             self.log("Шаг 2: Транскрипция...")
-            self.progress_var.set("Транскрипция аудио...")
-            scripts_dir = self.base_dir / "scripts"
-            cmd2 = f'python run_whisper.py "{audio_file}"'
-            if not self.run_command(cmd2, cwd=scripts_dir):
-                self.log("❌ Ошибка при транскрипции")
+            self.start_progress("Транскрипция аудио...", determinate=True)
+            try:
+                self.run_transcription(audio_file)
+            except Exception as e:
+                self.log(f"❌ Ошибка при транскрипции: {e}")
                 self.stop_progress("Ошибка")
                 return
             
@@ -569,13 +592,37 @@ class AudioProcessorGUI:
         threading.Thread(target=full_process, daemon=True).start()
 
 
-def transcribe_file(audio_path: Path, model_name: str = "large-v3"):
+def transcribe_file(audio_path: Path, model_name: str = "large-v3", progress_callback=None):
     """Transcribe the given audio file and save a `.txt` alongside it."""
     try:
         import whisper
+        import tqdm
+        import time
+        from functools import partial
 
-        model = whisper.load_model(model_name)
-        result = model.transcribe(str(audio_path))
+        start_time = time.time()
+
+        class TqdmLogger(tqdm.tqdm):
+            def __init__(self, *args, **kwargs):
+                self._callback = kwargs.pop("progress_callback", None)
+                super().__init__(*args, **kwargs)
+
+            def update(self, n=1):
+                super().update(n)
+                if self._callback and self.total:
+                    elapsed = time.time() - start_time
+                    rate = self.n / elapsed if elapsed > 0 else 0
+                    remaining = (self.total - self.n) / rate if rate > 0 else None
+                    self._callback(self.n / self.total, elapsed, remaining)
+
+        old_tqdm = tqdm.tqdm
+        tqdm.tqdm = partial(TqdmLogger, progress_callback=progress_callback)
+        try:
+            model = whisper.load_model(model_name)
+            result = model.transcribe(str(audio_path))
+        finally:
+            tqdm.tqdm = old_tqdm
+
         txt_path = audio_path.with_suffix('.txt')
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(result.get('text', ''))
