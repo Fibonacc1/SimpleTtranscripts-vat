@@ -470,9 +470,12 @@ class AudioProcessorGUI:
         progress_line = None
         self.progress_bar.config(mode='determinate', maximum=100, value=0)
 
-        def on_progress(progress, elapsed, remaining):
+        def on_progress(processed, total, elapsed, remaining):
             nonlocal progress_line
-            msg = f"Прогресс: {progress*100:.1f}% | прошло: {elapsed:.1f}с"
+            msg = f"Обработано: {processed}"
+            if total:
+                msg += f" из {total}"
+            msg += f" | прошло: {elapsed:.1f}с"
             if remaining is not None:
                 msg += f" | осталось: {remaining:.1f}с"
             if progress_line is not None:
@@ -481,7 +484,8 @@ class AudioProcessorGUI:
             progress_line = int(self.log_text.index(tk.END).split('.')[0]) - 2
             self.log_text.see(tk.END)
             self.root.update()
-            self.progress_bar['value'] = progress * 100
+            if total:
+                self.progress_bar['value'] = processed / total * 100
             if self.stop_event.is_set():
                 raise TranscriptionCancelled()
 
@@ -645,13 +649,7 @@ def transcribe_file(audio_path: Path, model_name: str = "large-v3", progress_cal
                     elapsed = time.time() - start_time
                     rate = self.n / elapsed if elapsed > 0 else 0
                     remaining = (self.total - self.n) / rate if self.total and rate > 0 else None
-                    if self.total:
-                        progress = self.n / self.total
-                    elif remaining is not None:
-                        progress = elapsed / (elapsed + remaining)
-                    else:
-                        progress = 0
-                    self._callback(progress, elapsed, remaining)
+                    self._callback(self.n, self.total, elapsed, remaining)
 
         old_tqdm = tqdm.tqdm
         tqdm.tqdm = partial(TqdmLogger, progress_callback=progress_callback, stop_event=stop_event)
